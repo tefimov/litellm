@@ -3,10 +3,11 @@ Polls LiteLLM_ManagedObjectTable to check if the batch job is complete, and if t
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, List, Literal, Optional, Protocol, Tuple, cast
+from typing import TYPE_CHECKING, Final, Literal, Optional, Protocol, Tuple, TypeAlias, cast
 
 from litellm._logging import verbose_proxy_logger
 from litellm._uuid import uuid
@@ -43,9 +44,31 @@ TERMINAL_MANAGED_OBJECT_STATUSES: Final[Tuple[str, ...]] = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _JobBilled:
+    model: str | None
+    api_provider: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _JobSettled:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _JobUnreconciled:
+    reason: str
+
+
+_JobOutcome: TypeAlias = _JobBilled | _JobSettled | _JobUnreconciled
+
+
 class _ManagedObjectRow(Protocol):
     @property
     def id(self) -> str: ...
+
+    @property
+    def status(self) -> str: ...
 
     @property
     def unified_object_id(self) -> str: ...
@@ -248,46 +271,85 @@ class CheckBatchCost:
 
         return metadata
 
-    async def _cleanup_stale_managed_objects(self) -> None:
-        """
-        Mark managed objects older than MANAGED_OBJECT_STALENESS_CUTOFF_DAYS days
-        in non-terminal states as 'stale_expired'. These will never complete and
-        should not be polled.
-        """
+    async def _cleanup_stale_managed_objects(
+        self, prom_logger: "PrometheusLogger | None"
+    ) -> list[tuple[str | None, str | None]]:
         cutoff: Final = datetime.now(timezone.utc) - timedelta(days=MANAGED_OBJECT_STALENESS_CUTOFF_DAYS)
-        result: Final = await _managed_object_table(self.prisma_client).update_many(
+        if self._has_batch_processed_column:
+            await _managed_object_table(self.prisma_client).update_many(
+                where={
+                    "file_purpose": "batch",
+                    "batch_processed": True,
+                    "status": {"not_in": list(TERMINAL_MANAGED_OBJECT_STATUSES)},
+                    "created_at": {"lt": cutoff},
+                },
+                data={"status": "stale_expired"},
+            )
+        batch_processed_filter: Final = (
+            {"batch_processed": False} if self._has_batch_processed_column else {}
+        )
+        status_filter: Final = (
+            {"not_in": ["failed", "expired", "cancelled", "stale_expired"]}
+            if self._has_batch_processed_column
+            else {"not_in": list(TERMINAL_MANAGED_OBJECT_STATUSES)}
+        )
+        candidates: Final = await _managed_object_table(self.prisma_client).find_many(
             where={
                 "file_purpose": "batch",
-                "status": {"not_in": list(TERMINAL_MANAGED_OBJECT_STATUSES)},
+                **batch_processed_filter,
+                "status": status_filter,
                 "created_at": {"lt": cutoff},
             },
-            data={"status": "stale_expired"},
+            take=MAX_OBJECTS_PER_POLL_CYCLE,
+            order={"created_at": "asc"},
         )
-        if result > 0:
-            verbose_proxy_logger.warning(
-                f"CheckBatchCost: marked {result} stale managed objects "
-                f"(older than {MANAGED_OBJECT_STALENESS_CUTOFF_DAYS} days) as stale_expired"
-            )
 
-        if not self._has_batch_processed_column:
+        processed_models: Final[list[tuple[str | None, str | None]]] = []
+        for job in candidates:
+            match await self._poll_job(job, prom_logger):
+                case _JobBilled(model=model, api_provider=api_provider):
+                    processed_models.append((model, api_provider))
+                case _JobSettled():
+                    pass
+                case _JobUnreconciled(reason=reason):
+                    await self._expire_unreconciled_job(job, reason, prom_logger)
+        return processed_models
+
+    async def _expire_unreconciled_job(
+        self,
+        job: "_ManagedObjectRow",
+        reason: str,
+        prom_logger: "PrometheusLogger | None",
+    ) -> None:
+        mark_completed_processed: Final = (
+            self._has_batch_processed_column and job.status in ("complete", "completed")
+        )
+        update_where: Final = {
+            "id": job.id,
+            **({"batch_processed": False} if self._has_batch_processed_column else {}),
+            **(
+                {"status": {"not_in": list(TERMINAL_MANAGED_OBJECT_STATUSES)}}
+                if not mark_completed_processed
+                else {}
+            ),
+        }
+        update_data: Final = (
+            {"batch_processed": True}
+            if mark_completed_processed
+            else {"status": "stale_expired"}
+        )
+        updated: Final = await _managed_object_table(self.prisma_client).update_many(
+            where=update_where,
+            data=update_data,
+        )
+        if updated == 0:
             return
-
-        # A row already in a terminal status is never rewritten by the sweep above, so
-        # without this it keeps a poll-page slot forever and starves newer batches.
-        retired: Final = await _managed_object_table(self.prisma_client).update_many(
-            where={
-                "file_purpose": "batch",
-                "batch_processed": False,
-                "status": {"in": ["complete", "completed"]},
-                "created_at": {"lt": cutoff},
-            },
-            data={"batch_processed": True},
+        verbose_proxy_logger.warning(
+            f"CheckBatchCost: batch {job.unified_object_id} is older than "
+            f"{MANAGED_OBJECT_STALENESS_CUTOFF_DAYS} days; cost never reconciled ({reason})"
         )
-        if retired > 0:
-            verbose_proxy_logger.warning(
-                f"CheckBatchCost: gave up on {retired} completed managed objects older than "
-                f"{MANAGED_OBJECT_STALENESS_CUTOFF_DAYS} days that were never costed"
-            )
+        if prom_logger is not None:
+            prom_logger.record_check_batch_cost_stale_expired()
 
     async def _fallback_find_jobs(self) -> "Sequence[_ManagedObjectRow]":
         """Query batch jobs without the batch_processed filter (for older schemas)."""
@@ -551,6 +613,102 @@ class CheckBatchCost:
         )
         self._record_error(prom_logger, "invalid_unified_id")
         return None
+
+    async def _poll_job(
+        self, job: "_ManagedObjectRow", prom_logger: "PrometheusLogger | None"
+    ) -> _JobOutcome:
+        routing: Final = self._resolve_job_routing(job, prom_logger)
+        if routing is None:
+            if self._has_unified_id_without_model(job):
+                await self._retire_job(job, "unified object id has no model id")
+            return _JobUnreconciled("job could not be routed")
+        model_id, batch_id = routing
+
+        verbose_proxy_logger.info(
+            f"Querying model ID: {model_id} for cost and usage of batch ID: {batch_id}"
+        )
+
+        try:
+            response: Final = await self.llm_router.aretrieve_batch(
+                model=model_id,
+                batch_id=batch_id,
+                litellm_metadata={
+                    "user_api_key_user_id": job.created_by or "default-user-id",
+                    "batch_ignore_default_logging": True,
+                },
+            )
+        except Exception as e:
+            verbose_proxy_logger.info(
+                f"Skipping job {job.unified_object_id} because of error querying model ID: {model_id} "
+                f"for cost and usage of batch ID: {batch_id}: {e}"
+            )
+            if prom_logger:
+                prom_logger.record_check_batch_cost_error("provider_retrieval_error")
+            if self._is_batch_gone_at_provider(e, batch_id) and self._batch_deployment_exists(model_id):
+                await self._retire_job(job, f"batch {batch_id} no longer exists at the provider")
+            return _JobUnreconciled(f"provider retrieval error: {e}")
+
+        if response.status in PROVIDER_TERMINAL_BATCH_STATUSES and response.output_file_id is not None:
+            try:
+                tracked: Final = await self._track_completed_batch_cost(
+                    job=job,
+                    response=response,
+                    model_id=model_id,
+                    batch_id=batch_id,
+                    prom_logger=prom_logger,
+                )
+            except Exception as tracking_err:
+                if self._is_output_file_gone_at_provider(
+                    tracking_err, response.output_file_id
+                ) and self._batch_deployment_exists(model_id):
+                    verbose_proxy_logger.warning(
+                        f"CheckBatchCost: output file {response.output_file_id} of batch {batch_id} "
+                        f"does not exist at the provider; retiring job {job.id} unbilled"
+                    )
+                    await self._finalize_unbilled_terminal_job(job, response)
+                    return _JobSettled()
+                verbose_proxy_logger.error(
+                    f"CheckBatchCost: failed to track cost for batch {batch_id} "
+                    f"(job {job.id}); leaving it unprocessed so the next poll retries: {tracking_err}"
+                )
+                self._record_error(prom_logger, "cost_tracking_error")
+                return _JobUnreconciled(f"cost tracking error: {tracking_err}")
+            if tracked is None:
+                return _JobUnreconciled(
+                    "cost not tracked: batch claimed by another poller or its deployment is gone"
+                )
+
+            try:
+                update_data: Final = {
+                    "status": response.status if response.status != "completed" else "complete",
+                    "file_object": response.model_dump_json(),
+                    **({"batch_processed": True} if self._has_batch_processed_column else {}),
+                }
+                await _managed_object_table(self.prisma_client).update(
+                    where={"id": job.id},
+                    data=update_data,
+                )
+            except Exception as db_err:
+                verbose_proxy_logger.error(
+                    f"CheckBatchCost: failed to mark job {job.id} complete in DB: {db_err}"
+                )
+            return _JobBilled(model=tracked[0], api_provider=tracked[1])
+
+        if response.status in PROVIDER_TERMINAL_BATCH_STATUSES:
+            from litellm.proxy.openai_files_endpoints.common_utils import (
+                _completed_batch_safe_to_retire,
+            )
+
+            if response.status in ("completed", "complete") and not _completed_batch_safe_to_retire(response):
+                verbose_proxy_logger.info(
+                    f"CheckBatchCost: batch {batch_id} is completed but its output file id "
+                    f"has not appeared yet; leaving job {job.id} for the next poll cycle"
+                )
+                return _JobUnreconciled(f"provider status {response.status} with lagging output file")
+            await self._finalize_unbilled_terminal_job(job, response)
+            return _JobSettled()
+
+        return _JobUnreconciled(f"provider status {response.status}")
 
     def _resolve_unmanaged_provider_routing(
         self,
@@ -947,10 +1105,10 @@ class CheckBatchCost:
             verbose_proxy_logger.error(f"CheckBatchCost: could not get Prometheus logger: {e}")
             prom_logger = None
 
-        processed_models: List[Tuple[Optional[str], Optional[str]]] = []
+        processed_models: Final[list[tuple[str | None, str | None]]] = []
 
         try:
-            await self._cleanup_stale_managed_objects()
+            processed_models.extend(await self._cleanup_stale_managed_objects(prom_logger))
         except Exception as cleanup_err:
             verbose_proxy_logger.warning(
                 f"CheckBatchCost: stale cleanup failed (poll will continue): {cleanup_err}"
@@ -995,100 +1153,13 @@ class CheckBatchCost:
         else:
             jobs = await self._fallback_find_jobs()
         for job in jobs:
-            routing = self._resolve_job_routing(job, prom_logger)
-            if routing is None:
-                if self._has_unified_id_without_model(job):
-                    await self._retire_job(job, "unified object id has no model id")
-                continue
-            model_id, batch_id = routing
-
-            verbose_proxy_logger.info(
-                f"Querying model ID: {model_id} for cost and usage of batch ID: {batch_id}"
-            )
-
-            try:
-                response = await self.llm_router.aretrieve_batch(
-                    model=model_id,
-                    batch_id=batch_id,
-                    litellm_metadata={
-                        "user_api_key_user_id": job.created_by or "default-user-id",
-                        "batch_ignore_default_logging": True,
-                    },
-                )
-            except Exception as e:
-                verbose_proxy_logger.info(
-                    f"Skipping job {job.unified_object_id} because of error querying model ID: {model_id} for cost and usage of batch ID: {batch_id}: {e}"
-                )
-                if prom_logger:
-                    prom_logger.record_check_batch_cost_error("provider_retrieval_error")
-                if self._is_batch_gone_at_provider(e, batch_id) and self._batch_deployment_exists(model_id):
-                    await self._retire_job(job, f"batch {batch_id} no longer exists at the provider")
-                continue
-
-            ## RETRIEVE THE BATCH JOB OUTPUT FILE
-            if (
-                response.status in PROVIDER_TERMINAL_BATCH_STATUSES
-                and response.output_file_id is not None
-            ):
-                try:
-                    tracked = await self._track_completed_batch_cost(
-                        job=job,
-                        response=response,
-                        model_id=model_id,
-                        batch_id=batch_id,
-                        prom_logger=prom_logger,
-                    )
-                except Exception as tracking_err:
-                    if self._is_output_file_gone_at_provider(
-                        tracking_err, response.output_file_id
-                    ) and self._batch_deployment_exists(model_id):
-                        verbose_proxy_logger.warning(
-                            f"CheckBatchCost: output file {response.output_file_id} of batch {batch_id} "
-                            f"does not exist at the provider; retiring job {job.id} unbilled"
-                        )
-                        await self._finalize_unbilled_terminal_job(job, response)
-                        continue
-                    verbose_proxy_logger.error(
-                        f"CheckBatchCost: failed to track cost for batch {batch_id} "
-                        f"(job {job.id}); leaving it unprocessed so the next poll retries: {tracking_err}"
-                    )
-                    self._record_error(prom_logger, "cost_tracking_error")
-                    continue
-                if tracked is None:
-                    continue
-
-                # Track this job for the final metrics summary
-                processed_models.append(tracked)
-
-                # mark the job as complete
-                try:
-                    update_data: dict = {
-                        "status": response.status if response.status != "completed" else "complete",
-                        "file_object": response.model_dump_json(),
-                    }
-                    if self._has_batch_processed_column:
-                        update_data["batch_processed"] = True
-                    await _managed_object_table(self.prisma_client).update(
-                        where={"id": job.id},
-                        data=update_data,
-                    )
-                except Exception as db_err:
-                    verbose_proxy_logger.error(
-                        f"CheckBatchCost: failed to mark job {job.id} complete in DB: {db_err}"
-                    )
-
-            elif response.status in PROVIDER_TERMINAL_BATCH_STATUSES:
-                from litellm.proxy.openai_files_endpoints.common_utils import (
-                    _completed_batch_safe_to_retire,
-                )
-
-                if response.status in ("completed", "complete") and not _completed_batch_safe_to_retire(response):
-                    verbose_proxy_logger.info(
-                        f"CheckBatchCost: batch {batch_id} is completed but its output file id "
-                        f"has not appeared yet; leaving job {job.id} for the next poll cycle"
-                    )
-                    continue
-                await self._finalize_unbilled_terminal_job(job, response)
+            match await self._poll_job(job, prom_logger):
+                case _JobBilled(model=model, api_provider=api_provider):
+                    processed_models.append((model, api_provider))
+                case _JobSettled():
+                    pass
+                case _JobUnreconciled():
+                    pass
 
         # Record polling run metrics (always, even if nothing was processed)
         if prom_logger:

@@ -8,15 +8,19 @@ ARN unified_object_id) batches with no managed unified id.
 
 import asyncio
 import json
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from litellm.constants import MANAGED_OBJECT_STALENESS_CUTOFF_DAYS
 
 if TYPE_CHECKING:
     from litellm.batches.batch_utils import BatchCostUsageResult
+    from litellm_enterprise.proxy.common_utils.check_batch_cost import CheckBatchCost
 
 _IS_B64 = "litellm.proxy.openai_files_endpoints.common_utils._is_base64_encoded_unified_file_id"
 _CLAIM_UNIFIED_BATCH_ID = "dW5pZmllZF9iYXRjaF9pZA=="
@@ -137,12 +141,14 @@ class TestCheckBatchCost:
         calls = (
             mock_prisma_client.db.litellm_managedobjecttable.update_many.call_args_list
         )
-        stale_call = calls[0]
-        assert stale_call[1]["data"] == {"status": "stale_expired"}
-        where = stale_call[1]["where"]
-        assert where["file_purpose"] == "batch"
-        assert "stale_expired" in where["status"]["not_in"]
-        assert "created_at" in where
+        assert all(call[1]["where"]["file_purpose"] == "batch" for call in calls)
+        read_calls: Final = mock_prisma_client.db.litellm_managedobjecttable.find_many.call_args_list
+        assert all(call[1]["where"]["file_purpose"] == "batch" for call in read_calls)
+        settled_call: Final = calls[0][1]
+        assert settled_call["where"]["batch_processed"] is True
+        assert settled_call["where"]["status"]["not_in"]
+        assert settled_call["where"]["created_at"]["lt"]
+        assert settled_call["data"] == {"status": "stale_expired"}
 
     @pytest.mark.asyncio
     async def test_startup_probe_confirms_batch_processed_support(
@@ -224,9 +230,8 @@ class TestCheckBatchCost:
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
             return_value=1
         )
-        # First find_many (primary query) raises with a schema error; second (fallback) returns empty
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            side_effect=[Exception("column batch_processed does not exist"), []]
+            side_effect=[[], Exception("column batch_processed does not exist"), []]
         )
 
         await check_batch_cost_instance.check_batch_cost()
@@ -234,8 +239,9 @@ class TestCheckBatchCost:
         calls = (
             mock_prisma_client.db.litellm_managedobjecttable.find_many.call_args_list
         )
-        assert len(calls) == 2
-        fallback_where = calls[1][1]["where"]
+        assert len(calls) == 3
+        assert calls[0][1]["where"]["created_at"]["lt"]
+        fallback_where: Final = calls[2][1]["where"]
         assert "batch_processed" not in fallback_where
         assert "stale_expired" in fallback_where["status"]["not_in"]
         assert calls[1][1]["take"] == MAX_OBJECTS_PER_POLL_CYCLE
@@ -261,9 +267,8 @@ class TestCheckBatchCost:
 
         await check_batch_cost_instance.check_batch_cost()
 
-        # Only one find_many call — the fallback directly, no primary query attempt
         assert (
-            mock_prisma_client.db.litellm_managedobjecttable.find_many.call_count == 1
+            mock_prisma_client.db.litellm_managedobjecttable.find_many.call_count == 2
         )
         fallback_where = (
             mock_prisma_client.db.litellm_managedobjecttable.find_many.call_args[1][
@@ -299,7 +304,7 @@ class TestCheckBatchCost:
         # Simulate column already known absent (e.g. discovered on a previous cycle)
         check_batch_cost_instance._has_batch_processed_column = False
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         # Build a fake batch response whose status triggers the completion branch
@@ -404,7 +409,7 @@ class TestCheckBatchCost:
         mock_job.id = "job-bedrock-1"
         mock_job.unified_object_id = "dW5pZmllZF9iYXRjaF9pZA=="
         mock_job.created_by = "user-1"
-        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(return_value=[mock_job])
+        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(side_effect=[[], [mock_job]])
 
         mock_response = MagicMock()
         mock_response.status = "completed"
@@ -510,7 +515,7 @@ class TestCheckBatchCost:
         mock_job.id = "job-poller-rates-1"
         mock_job.unified_object_id = "dW5pZmllZF9iYXRjaF9pZA=="
         mock_job.created_by = "user-1"
-        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(return_value=[mock_job])
+        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(side_effect=[[], [mock_job]])
 
         mock_response = MagicMock()
         mock_response.status = "completed"
@@ -610,7 +615,7 @@ class TestCheckBatchCost:
             b"litellm_proxy;model_id:model-123;llm_batch_id:batch-456"
         ).decode()
         mock_job.created_by = "user-1"
-        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(return_value=[mock_job])
+        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(side_effect=[[], [mock_job]])
 
         mock_response = MagicMock()
         mock_response.status = "completed"
@@ -693,7 +698,7 @@ class TestCheckBatchCost:
 
         assert check_batch_cost_instance._has_batch_processed_column is True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         mock_response = MagicMock()
@@ -804,8 +809,7 @@ class TestCheckBatchCost:
         mock_job.unified_object_id = "dW5pZmllZF9iYXRjaF9pZA=="
         mock_job.created_by = None
         mock_job.team_id = None
-
-        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(return_value=[mock_job])
+        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(side_effect=[[], [mock_job]])
 
         # A real LiteLLMBatch (not a bare MagicMock): this test runs the real
         # litellm_logging.Logging pipeline, which type-checks the result via
@@ -930,7 +934,7 @@ class TestCheckBatchCost:
         mock_job.created_by = "user-1"
 
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         mock_response = MagicMock()
@@ -1001,7 +1005,7 @@ class TestCheckBatchCost:
 
         assert check_batch_cost_instance._has_batch_processed_column is True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         mock_response = MagicMock()
@@ -1087,7 +1091,7 @@ class TestCheckBatchCost:
 
         check_batch_cost_instance._has_batch_processed_column = True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         response = LiteLLMBatch(
@@ -1178,7 +1182,7 @@ class TestCheckBatchCost:
 
         assert check_batch_cost_instance._has_batch_processed_column is True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         mock_response = MagicMock()
@@ -1263,7 +1267,7 @@ class TestCheckBatchCost:
 
         assert check_batch_cost_instance._has_batch_processed_column is True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         mock_response = MagicMock()
@@ -1310,7 +1314,7 @@ class TestCheckBatchCost:
         mock_job.created_by = "user-1"
 
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         mock_response = MagicMock()
@@ -1371,7 +1375,7 @@ class TestCheckBatchCost:
 
         assert check_batch_cost_instance._has_batch_processed_column is True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         mock_response = MagicMock()
@@ -1484,7 +1488,7 @@ class TestCheckBatchCost:
             b"litellm_proxy;model_id:model-123;llm_batch_id:batch-456"
         ).decode()
         mock_job.created_by = "user-1"
-        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(return_value=[mock_job])
+        mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(side_effect=[[], [mock_job]])
 
         mock_response = MagicMock()
         mock_response.status = "completed"
@@ -1597,7 +1601,7 @@ class TestCheckBatchCost:
 
         assert check_batch_cost_instance._has_batch_processed_column is True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         missing_output_file_id = "gs://batch-out/job-1/predictions.jsonl"
@@ -1667,7 +1671,7 @@ class TestCheckBatchCost:
 
         check_batch_cost_instance._has_batch_processed_column = True
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[mock_job]
+            side_effect=[[], [mock_job]]
         )
 
         raw_output_file_id = "file-batch-output-abc123"
@@ -2001,7 +2005,7 @@ class TestUnmanagedVertexRouting:
         prisma.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=1)
         prisma.db.litellm_managedobjecttable.update = AsyncMock()
         prisma.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[self._job()]
+            side_effect=[[], [self._job()]]
         )
         prisma.db.litellm_usertable = MagicMock()
         prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
@@ -2231,7 +2235,7 @@ class TestUnmanagedBedrockRouting:
         prisma.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=1)
         prisma.db.litellm_managedobjecttable.update = AsyncMock()
         prisma.db.litellm_managedobjecttable.find_many = AsyncMock(
-            return_value=[self._job()]
+            side_effect=[[], [self._job()]]
         )
         prisma.db.litellm_usertable = MagicMock()
         prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
@@ -2830,7 +2834,7 @@ class TestPollPageStarvation:
         prisma = MagicMock()
         prisma.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=0)
         prisma.db.litellm_managedobjecttable.update = AsyncMock()
-        prisma.db.litellm_managedobjecttable.find_many = AsyncMock(return_value=jobs)
+        prisma.db.litellm_managedobjecttable.find_many = AsyncMock(side_effect=[[], jobs])
         prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
         return prisma
 
@@ -2959,23 +2963,6 @@ class TestPollPageStarvation:
         }
 
     @pytest.mark.asyncio
-    async def test_stale_cleanup_gives_up_on_never_costed_completed_rows(self):
-        """A row already in a terminal status is never rewritten by the staleness sweep, so
-        it needs its own bound or it starves newer batches indefinitely."""
-        prisma = self._prisma([])
-
-        await self._instance(prisma, MagicMock()).check_batch_cost()
-
-        calls = prisma.db.litellm_managedobjecttable.update_many.call_args_list
-        assert len(calls) == 2, "expected the staleness sweep plus the never-costed sweep"
-        where = calls[1][1]["where"]
-        assert where["file_purpose"] == "batch"
-        assert where["batch_processed"] is False
-        assert where["status"] == {"in": ["complete", "completed"]}
-        assert "created_at" in where
-        assert calls[1][1]["data"] == {"batch_processed": True}
-
-    @pytest.mark.asyncio
     async def test_newer_batch_is_polled_once_dead_rows_are_retired(self):
         """The end state the customer cares about: dead rows retire on the cycle they are
         first seen, and the healthy batch behind them keeps getting polled."""
@@ -3061,7 +3048,7 @@ class _FakeManagedObjectRow:
         self.team_id = None
         self.api_key = None
         self.request_tags = None
-        self.created_at = 1700000000
+        self.created_at = datetime.max.replace(tzinfo=timezone.utc)
         self.file_object = json.dumps(
             {"id": "batch-456", "status": "in_progress", "input_file_id": "file-input-1",
              "output_file_id": _CLAIM_OUTPUT_FILE_ID}
@@ -3073,46 +3060,70 @@ class _FakeManagedObjectTable:
 
     It honours the batch_processed and status filters, so the poller's compare-and-swap
     and the managed-files deletion guard both read the same state a shared Postgres row
-    would give them. Staleness sweeps (the only queries scoped by created_at) never match.
+    would give them.
     """
 
-    def __init__(self, row: _FakeManagedObjectRow, journal: list):
-        self.row = row
+    def __init__(self, rows: _FakeManagedObjectRow | list[_FakeManagedObjectRow], journal: list[str]):
+        self.rows: list[_FakeManagedObjectRow] = rows if isinstance(rows, list) else [rows]
+        self.row = self.rows[0]
         self.journal = journal
         self.update_many = AsyncMock(side_effect=self._update_many)
         self.update = AsyncMock(side_effect=self._update)
         self.find_many = AsyncMock(side_effect=self._find_many)
         self.find_first = AsyncMock(return_value=None)
 
-    def _matches(self, where: dict) -> bool:
+    @staticmethod
+    def _matches(row: _FakeManagedObjectRow, where: dict[str, object]) -> bool:
         for key, value in where.items():
             if key == "created_at":
-                return False
+                if not isinstance(value, Mapping):
+                    return False
+                cutoff: Final = value.get("lt")
+                if not isinstance(cutoff, datetime) or row.created_at >= cutoff:
+                    return False
             if key == "status":
-                if self.row.status in value.get("not_in", []):
+                if not isinstance(value, Mapping):
                     return False
-                if "in" in value and self.row.status not in value["in"]:
+                excluded: Final = value.get("not_in", ())
+                included: Final = value.get("in", ())
+                if isinstance(excluded, Sequence) and row.status in excluded:
                     return False
-            elif getattr(self.row, key) != value:
+                if isinstance(included, Sequence) and "in" in value and row.status not in included:
+                    return False
+            elif key != "created_at" and getattr(row, key) != value:
                 return False
         return True
 
-    async def _update_many(self, *, where: dict, data: dict) -> int:
-        if not self._matches(where):
-            return 0
-        if "batch_processed" in where:
-            self.journal.append("claim" if data.get("batch_processed") else "release")
-        for key, value in data.items():
-            setattr(self.row, key, value)
-        return 1
+    async def _update_many(self, *, where: dict[str, object], data: dict[str, object]) -> int:
+        matched_rows: Final = [row for row in self.rows if self._matches(row, where)]
+        for row in matched_rows:
+            if "batch_processed" in where and "batch_processed" in data:
+                self.journal.append("claim" if data["batch_processed"] else "release")
+            for key, value in data.items():
+                setattr(row, key, value)
+        return len(matched_rows)
 
-    async def _update(self, *, where: dict, data: dict) -> None:
+    async def _update(self, *, where: dict[str, object], data: dict[str, object]) -> None:
         self.journal.append("finalize")
-        for key, value in data.items():
-            setattr(self.row, key, value)
+        for row in self.rows:
+            if self._matches(row, where):
+                for key, value in data.items():
+                    setattr(row, key, value)
 
-    async def _find_many(self, *, where: dict, take=None, order=None) -> list:
-        return [self.row] if self._matches(where) else []
+    async def _find_many(
+        self,
+        *,
+        where: dict[str, object],
+        take: int | None = None,
+        order: dict[str, str] | None = None,
+    ) -> list[_FakeManagedObjectRow]:
+        matched_rows: Final = [row for row in self.rows if self._matches(row, where)]
+        ordered_rows: Final = sorted(
+            matched_rows,
+            key=lambda row: row.created_at,
+            reverse=order == {"created_at": "desc"},
+        )
+        return ordered_rows[:take] if take is not None else ordered_rows
 
 
 class TestMultiPodBatchCostClaim:
@@ -3396,3 +3407,288 @@ class TestMultiPodBatchCostClaim:
         assert self._claim_calls(prisma) == []
         assert journal == ["fetch", "bill", "finalize"]
         logging_obj.async_success_handler.assert_awaited_once()
+
+
+class TestStaleManagedObjectReconciliation:
+    @staticmethod
+    def _old_row(
+        status: str, batch_processed: bool = False, job_id: str = "job-claim-1"
+    ) -> _FakeManagedObjectRow:
+        row: Final = _FakeManagedObjectRow()
+        row.id = job_id
+        row.status = status
+        row.batch_processed = batch_processed
+        row.created_at = datetime.min.replace(tzinfo=timezone.utc)
+        return row
+
+    @staticmethod
+    def _instance(prisma: MagicMock, llm_router: MagicMock) -> "CheckBatchCost":
+        return TestMultiPodBatchCostClaim._instance(prisma, llm_router)
+
+    @staticmethod
+    def _prisma(
+        rows: _FakeManagedObjectRow | list[_FakeManagedObjectRow], journal: list[str]
+    ) -> MagicMock:
+        prisma: Final = TestMultiPodBatchCostClaim._prisma(rows, journal)
+        return prisma
+
+    @staticmethod
+    def _router(
+        status: str = "completed", output_file_id: str | None = _CLAIM_OUTPUT_FILE_ID
+    ) -> MagicMock:
+        router: Final = TestMultiPodBatchCostClaim._router()
+        router.aretrieve_batch.return_value.status = status
+        router.aretrieve_batch.return_value.output_file_id = output_file_id
+        return router
+
+    @pytest.mark.asyncio
+    async def test_stale_completed_batch_is_costed_before_expiration(self):
+        row: Final = self._old_row("validating")
+        settled_row: Final = self._old_row(
+            "in_progress", batch_processed=True, job_id="job-settled"
+        )
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma([row, settled_row], journal)
+        prom_logger: Final = MagicMock()
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal) as logging_obj,
+        ):
+            await self._instance(prisma, self._router()).check_batch_cost()
+
+        assert row.status == "complete"
+        assert row.batch_processed is True
+        assert settled_row.status == "stale_expired"
+        assert logging_obj.async_success_handler.await_count == 1
+        assert logging_obj.async_success_handler.await_args.kwargs["batch_cost"] == 0.01
+        assert prom_logger.record_check_batch_cost_stale_expired.call_count == 0
+        prom_logger.record_check_batch_cost_run.assert_called_once_with(
+            jobs_polled=0,
+            processed_models=[("gpt-4", "openai")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_nonterminal_batch_is_expired_and_counted(self):
+        row: Final = self._old_row("validating")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal) as logging_obj,
+        ):
+            await self._instance(prisma, self._router(status="in_progress")).check_batch_cost()
+
+        assert row.status == "stale_expired"
+        logging_obj.async_success_handler.assert_not_awaited()
+        prom_logger.record_check_batch_cost_stale_expired.assert_called_once_with()
+
+    @pytest.mark.parametrize("condition", ["lagging_output", "tracking_error"])
+    @pytest.mark.asyncio
+    async def test_stale_cleanup_gives_up_on_never_costed_completed_rows(self, condition: str):
+        row: Final = self._old_row("completed")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+
+        async def _raise_during_fetch() -> None:
+            raise RuntimeError("output file read failed")
+
+        during_fetch: Final = _raise_during_fetch if condition == "tracking_error" else None
+        output_file_id: Final = _CLAIM_OUTPUT_FILE_ID if condition == "tracking_error" else None
+        router: Final = self._router(status="completed", output_file_id=output_file_id)
+        router.aretrieve_batch.return_value.request_counts = None
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(
+                journal, during_fetch=during_fetch
+            ) as logging_obj,
+        ):
+            await self._instance(prisma, router).check_batch_cost()
+
+        assert row.status == "completed"
+        assert row.batch_processed is True
+        logging_obj.async_success_handler.assert_not_awaited()
+        prom_logger.record_check_batch_cost_stale_expired.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_stale_batch_already_processed_is_not_retrieved(self):
+        row: Final = self._old_row("in_progress", batch_processed=True)
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+        router: Final = self._router(status="in_progress")
+
+        with patch(
+            "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+            return_value=prom_logger,
+        ):
+            await self._instance(prisma, router).check_batch_cost()
+
+        router.aretrieve_batch.assert_not_awaited()
+        assert row.status == "stale_expired"
+        prom_logger.record_check_batch_cost_stale_expired.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_old_schema_stale_completed_batch_is_costed(self):
+        row: Final = self._old_row("validating")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+        instance: Final = self._instance(prisma, self._router())
+        instance._has_batch_processed_column = False
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal) as logging_obj,
+        ):
+            await instance.check_batch_cost()
+
+        assert row.status == "complete"
+        assert logging_obj.async_success_handler.await_count == 1
+        assert logging_obj.async_success_handler.await_args.kwargs["batch_cost"] == 0.01
+        prom_logger.record_check_batch_cost_stale_expired.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_old_schema_stale_nonterminal_batch_is_expired_and_counted(self):
+        row: Final = self._old_row("validating")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+        router: Final = self._router(status="in_progress")
+        instance: Final = self._instance(prisma, router)
+        instance._has_batch_processed_column = False
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal) as logging_obj,
+        ):
+            await instance.check_batch_cost()
+
+        assert row.status == "stale_expired"
+        router.aretrieve_batch.assert_awaited_once()
+        logging_obj.async_success_handler.assert_not_awaited()
+        prom_logger.record_check_batch_cost_stale_expired.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_stale_retrieve_error_is_expired_and_counted(self):
+        row: Final = self._old_row("validating")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+        router: Final = self._router()
+        router.aretrieve_batch = AsyncMock(side_effect=RuntimeError("provider unavailable"))
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal) as logging_obj,
+        ):
+            await self._instance(prisma, router).check_batch_cost()
+
+        assert row.status == "stale_expired"
+        logging_obj.async_success_handler.assert_not_awaited()
+        prom_logger.record_check_batch_cost_stale_expired.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_completion_is_not_overwritten_or_counted(self):
+        row: Final = self._old_row("validating")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+        response: Final = MagicMock()
+        response.status = "in_progress"
+        router: Final = MagicMock()
+
+        async def _complete_during_retrieve(**kwargs: object) -> MagicMock:
+            row.status = "completed"
+            return response
+
+        router.aretrieve_batch = AsyncMock(side_effect=_complete_during_retrieve)
+        instance: Final = self._instance(prisma, router)
+        instance._has_batch_processed_column = False
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal),
+        ):
+            await instance.check_batch_cost()
+
+        assert row.status == "completed"
+        prom_logger.record_check_batch_cost_stale_expired.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_row_claimed_by_other_poller_is_not_expired(self) -> None:
+        row: Final = self._old_row("validating")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+        router: Final = self._router(status="in_progress")
+        response: Final = router.aretrieve_batch.return_value
+
+        async def _other_poller_claims_batch(**kwargs: object) -> MagicMock:
+            row.batch_processed = True
+            return response
+
+        router.aretrieve_batch = AsyncMock(side_effect=_other_poller_claims_batch)
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal),
+        ):
+            await self._instance(prisma, router).check_batch_cost()
+
+        router.aretrieve_batch.assert_awaited_once()
+        assert journal == []
+        assert row.status == "validating"
+        assert row.batch_processed is True
+        prom_logger.record_check_batch_cost_stale_expired.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_completed_row_with_missing_deployment_is_retired_and_counted(self) -> None:
+        row: Final = self._old_row("validating")
+        journal: Final[list[str]] = []
+        prisma: Final = self._prisma(row, journal)
+        prom_logger: Final = MagicMock()
+        router: Final = self._router(status="completed")
+        router.get_deployment.return_value = None
+
+        with (
+            patch(
+                "litellm.integrations.prometheus.PrometheusLogger.get_instance",
+                return_value=prom_logger,
+            ),
+            TestMultiPodBatchCostClaim._billing_patches(journal) as logging_obj,
+        ):
+            await self._instance(prisma, router).check_batch_cost()
+
+        assert journal == ["fetch"]
+        assert row.status == "stale_expired"
+        assert row.batch_processed is False
+        logging_obj.async_success_handler.assert_not_awaited()
+        prom_logger.record_check_batch_cost_stale_expired.assert_called_once_with()
